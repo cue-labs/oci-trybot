@@ -326,10 +326,16 @@ func (c *client) do(req *http.Request, okStatuses ...int) (*http.Response, error
 		resp.Body = io.NopCloser(bytes.NewReader(data))
 		c.logf("%s", buf.Bytes())
 	}
-	if len(okStatuses) == 0 && resp.StatusCode == http.StatusOK {
-		return resp, nil
-	}
-	if slices.Contains(okStatuses, resp.StatusCode) {
+	if len(okStatuses) == 0 && resp.StatusCode == http.StatusOK ||
+		slices.Contains(okStatuses, resp.StatusCode) {
+		// When asking for content as-is, any other encoding means that
+		// neither the body nor the Content-Length match the content.
+		if req.Header.Get("Accept-Encoding") == "identity" {
+			if enc := resp.Header.Get("Content-Encoding"); enc != "" && enc != "identity" {
+				resp.Body.Close()
+				return nil, fmt.Errorf("unexpected Content-Encoding %q", enc)
+			}
+		}
 		return resp, nil
 	}
 	defer resp.Body.Close()
@@ -422,5 +428,19 @@ func newRequest(ctx context.Context, rreq *ocirequest.Request, body io.Reader) (
 	ctx = ociauth.ContextWithRequestInfo(ctx, ociauth.RequestInfo{
 		RequiredScope: scopeForRequest(rreq),
 	})
-	return http.NewRequestWithContext(ctx, method, u, body)
+	req, err := http.NewRequestWithContext(ctx, method, u, body)
+	if err != nil {
+		return nil, err
+	}
+	switch rreq.Kind {
+	case ocirequest.ReqBlobGet, ocirequest.ReqBlobHead,
+		ocirequest.ReqManifestGet, ocirequest.ReqManifestHead:
+		// Ask for content as-is: compression gains little for blobs,
+		// which are usually compressed already, nor for manifests,
+		// which are usually small. Moreover, net/http's transparent
+		// decompression would drop the Content-Length that we use
+		// to determine the size of the content.
+		req.Header.Set("Accept-Encoding", "identity")
+	}
+	return req, nil
 }
